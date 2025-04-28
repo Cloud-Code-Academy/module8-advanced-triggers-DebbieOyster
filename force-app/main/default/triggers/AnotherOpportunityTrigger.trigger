@@ -163,4 +163,5 @@ trigger AnotherOpportunityTrigger on Opportunity (before insert, after insert, b
             update oppsToUpdate;
         }
     }
+    
 }
