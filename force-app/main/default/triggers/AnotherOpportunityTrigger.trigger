@@ -10,8 +10,8 @@ IMPORTANT:
 ISSUES:
 Avoid nested for loop - 1 instance
 Avoid DML inside for loop - 1 instance
-Bulkify Your Code - 1 instance
-Avoid SOQL Query inside for loop - 2 instances
+Bulkify Your Code - 1 instance 
+Avoid SOQL Query inside for loop - 2 instances x  
 Stop recursion - 1 instance
 
 RESOURCES: 
@@ -22,10 +22,23 @@ trigger AnotherOpportunityTrigger on Opportunity (before insert, after insert, b
     if (Trigger.isBefore){
         if (Trigger.isInsert){
             // Set default Type for new Opportunities
-            Opportunity opp = Trigger.new[0];
-            if (opp.Type == null){
-                opp.Type = 'New Customer';
+            //Bulkify Code
+            for(Opportunity opp : Trigger.new) {
+                if (opp.Type == null){
+                    opp.Type = 'New Customer';
+                }
             }        
+        } else if (Trigger.isUpdate){
+            // Append Stage changes in Opportunity Description
+            //Move up to before update (complete)
+            for (Opportunity opp : Trigger.new) {
+                Opportunity oldOpp = Trigger.oldMap.get(opp.Id);
+    
+                if (opp.StageName != null && opp.StageName != oldOpp.StageName) {
+                    opp.Description += '\n Stage Change:' + opp.StageName + ':' + DateTime.now().format();
+                }
+            }
+            
         } else if (Trigger.isDelete){
             // Prevent deletion of closed Opportunities
             for (Opportunity oldOpp : Trigger.old){
@@ -39,6 +52,8 @@ trigger AnotherOpportunityTrigger on Opportunity (before insert, after insert, b
     if (Trigger.isAfter){
         if (Trigger.isInsert){
             // Create a new Task for newly inserted Opportunities
+            //DML in For Loop (complete)
+            List<Task> tasks = new List<Task>();
             for (Opportunity opp : Trigger.new){
                 Task tsk = new Task();
                 tsk.Subject = 'Call Primary Contact';
@@ -46,19 +61,14 @@ trigger AnotherOpportunityTrigger on Opportunity (before insert, after insert, b
                 tsk.WhoId = opp.Primary_Contact__c;
                 tsk.OwnerId = opp.OwnerId;
                 tsk.ActivityDate = Date.today().addDays(3);
-                insert tsk;
+                //Add new Task to List
+                tasks.add(tsk);   
             }
-        } else if (Trigger.isUpdate){
-            // Append Stage changes in Opportunity Description
-            for (Opportunity opp : Trigger.new){
-                for (Opportunity oldOpp : Trigger.old){
-                    if (opp.StageName != null){
-                        opp.Description += '\n Stage Change:' + opp.StageName + ':' + DateTime.now().format();
-                    }
-                }                
+            if (!tasks.isEmpty()) {
+                insert tasks;
             }
-            update Trigger.new;
-        }
+
+        } 
         // Send email notifications when an Opportunity is deleted 
         else if (Trigger.isDelete){
             notifyOwnersOpportunityDeleted(Trigger.old);
@@ -76,9 +86,22 @@ trigger AnotherOpportunityTrigger on Opportunity (before insert, after insert, b
     */
     private static void notifyOwnersOpportunityDeleted(List<Opportunity> opps) {
         List<Messaging.SingleEmailMessage> mails = new List<Messaging.SingleEmailMessage>();
-        for (Opportunity opp : opps){
+        // Get User Ids from Opp - put in set
+        Set<Id> userIds = new Set<Id>();
+    
+        // Loop through Opps, adding users to the set of users to query for
+        for (Opportunity opp : opps) {
+            userIds.add(opp.OwnerId);
+        }
+    
+        // Query once outside loop
+        Map<Id, User> usersMap = new Map<Id, User>(
+            [SELECT Id, Email FROM User WHERE Id IN :userIds]
+        );
+    
+        for (Opportunity opp : opps) {
+            String[] toAddresses = new String[] {usersMap.get(opp.OwnerId).Email};
             Messaging.SingleEmailMessage mail = new Messaging.SingleEmailMessage();
-            String[] toAddresses = new String[] {[SELECT Id, Email FROM User WHERE Id = :opp.OwnerId].Email};
             mail.setToAddresses(toAddresses);
             mail.setSubject('Opportunity Deleted : ' + opp.Name);
             mail.setPlainTextBody('Your Opportunity: ' + opp.Name +' has been deleted.');
@@ -98,15 +121,47 @@ trigger AnotherOpportunityTrigger on Opportunity (before insert, after insert, b
     - Only updates the Opportunities that don't already have a primary contact.
     */
     private static void assignPrimaryContact(Map<Id,Opportunity> oppNewMap) {        
-        Map<Id, Opportunity> oppMap = new Map<Id, Opportunity>();
+    
+        //collection of accountIds
+        Set<Id> accountIds = new Set<Id>();
         for (Opportunity opp : oppNewMap.values()){            
-            Contact primaryContact = [SELECT Id, AccountId FROM Contact WHERE Title = 'VP Sales' AND AccountId = :opp.AccountId LIMIT 1];
-            if (opp.Primary_Contact__c == null){
-                Opportunity oppToUpdate = new Opportunity(Id = opp.Id);
-                oppToUpdate.Primary_Contact__c = primaryContact.Id;
-                oppMap.put(opp.Id, oppToUpdate);
+            if(opp.AccountId != null) {
+                accountIds.add(opp.AccountId);
             }
         }
-        update oppMap.values();
+        //Query Contacts from AccountIds
+        List<Contact> primaryContacts = [
+                SELECT Id, AccountId 
+                FROM Contact 
+                WHERE Title = 'VP Sales' AND AccountId IN :accountIds
+            ];
+        //Build Map AccountId to one VP Sales Contact for easy lookup
+        Map<Id, Contact> accountToVPContactMap = new Map<Id, Contact>();
+        //Loop Contacts and Assign Values to Map
+        for (Contact c : primaryContacts) {
+            if (!accountToVPContactMap.containsKey(c.AccountId)) {
+                accountToVPContactMap.put(c.AccountId, c);
+            }
+        }     
+        //Collection opp variable for bulk update
+        List<Opportunity> oppsToUpdate = new List<Opportunity>();
+        //Loop Opps
+        for (Opportunity opp :oppNewMap.values()) {
+            //Determine if current opp accountId in in the Map
+            if (accountToVPContactMap.containsKey(opp.AccountId) && opp.Primary_Contact__c == null) {
+                //Single Current - Opp Values to update 
+                Opportunity oppToUpdate = new Opportunity(
+                    Id = opp.Id,
+                    Primary_Contact__c = accountToVPContactMap.get(opp.AccountId).Id
+                );
+                //add to collection variable for update
+                oppsToUpdate.add(oppToUpdate);
+            }
+        }
+        //Perform DML only if needed
+        if (!oppsToUpdate.isEmpty()) {
+            update oppsToUpdate;
+        }
     }
+    
 }
